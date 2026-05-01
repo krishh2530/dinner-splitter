@@ -13,7 +13,7 @@ const io     = new Server(server);
 // CONFIG
 // ──────────────────────────────────────────────────────────
 const PORT           = process.env.PORT || 3000;
-const MONGO_URI      = process.env.MONGODB_URI || 'mongodb://localhost:27017/dinnertab';
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/dinnertab';
 const OWNER_PASSWORD = 'FinalHangout';
 const SUPER_OWNER    = 'krishna';
 
