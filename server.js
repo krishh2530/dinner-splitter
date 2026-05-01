@@ -1,89 +1,124 @@
-const express = require('express');
-const http = require('http');
+const express    = require('express');
+const http       = require('http');
 const { Server } = require('socket.io');
-const fs = require('fs');
-const path = require('path');
+const mongoose   = require('mongoose');
+const crypto     = require('crypto');
+const path       = require('path');
 
-const app = express();
+const app    = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io     = new Server(server);
 
 // ──────────────────────────────────────────────────────────
-// DATA STORE  (simple JSON file — perfect for one dinner)
+// MONGODB CONNECTION
 // ──────────────────────────────────────────────────────────
-const DB_PATH = path.join(__dirname, 'data.json');
-
-function loadDB() {
-  if (!fs.existsSync(DB_PATH)) return freshDB();
-  try { return JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); }
-  catch { return freshDB(); }
-}
-
-function freshDB() {
-  return {
-    users: [],
-    orders: [],
-    participants: [],   // { orderId, userId, status: 'pending'|'accepted'|'declined' }
-    notifications: [],  // { id, userId, orderId, type, isRead }
-    billSettings: { cgst: 0, sgst: 0, serviceCharge: 0, discount: 0 },
-    _seq: { users: 0, orders: 0, participants: 0, notifications: 0 }
-  };
-}
-
-function saveDB(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
-}
-
-function nextId(db, table) {
-  db._seq[table] = (db._seq[table] || 0) + 1;
-  return db._seq[table];
-}
+const MONGO_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/dinnertab';
+mongoose.connect(MONGO_URI)
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => { console.error('❌ MongoDB error:', err.message); process.exit(1); });
 
 // ──────────────────────────────────────────────────────────
-// SOCKET.IO — track online users
+// CONSTANTS
 // ──────────────────────────────────────────────────────────
-const onlineMap = new Map(); // userId -> socketId
+const OWNER_PASSWORD  = 'FinalHangout';   // gives owner access
+const SUPER_OWNER     = 'krishna';        // only krishna can reset
 
-io.on('connection', (socket) => {
-  socket.on('auth', (userId) => {
-    onlineMap.set(Number(userId), socket.id);
-  });
+// ──────────────────────────────────────────────────────────
+// SCHEMAS
+// ──────────────────────────────────────────────────────────
+const userSchema = new mongoose.Schema({
+  name:         { type: String, required: true, unique: true },
+  isOwner:      { type: Boolean, default: false },
+  isSuperOwner: { type: Boolean, default: false },
+  sessionToken: { type: String, default: null },   // locks the name to one device
+  createdAt:    { type: Date, default: Date.now }
+});
+
+const orderSchema = new mongoose.Schema({
+  dishName:  { type: String, required: true },
+  price:     { type: Number, required: true },
+  orderType: { type: String, enum: ['solo','group'], required: true },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const participantSchema = new mongoose.Schema({
+  orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', required: true },
+  userId:  { type: mongoose.Schema.Types.ObjectId, ref: 'User',  required: true },
+  status:  { type: String, enum: ['pending','accepted','declined'], default: 'pending' }
+});
+
+const notificationSchema = new mongoose.Schema({
+  userId:    { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  orderId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Order' },
+  type:      { type: String },
+  isRead:    { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const billSettingsSchema = new mongoose.Schema({
+  _id:           { type: String, default: 'singleton' },
+  cgst:          { type: Number, default: 0 },
+  sgst:          { type: Number, default: 0 },
+  serviceCharge: { type: Number, default: 0 },
+  discount:      { type: Number, default: 0 }
+});
+
+const User         = mongoose.model('User',         userSchema);
+const Order        = mongoose.model('Order',        orderSchema);
+const Participant  = mongoose.model('Participant',  participantSchema);
+const Notification = mongoose.model('Notification', notificationSchema);
+const BillSettings = mongoose.model('BillSettings', billSettingsSchema);
+
+// ──────────────────────────────────────────────────────────
+// SOCKET.IO
+// ──────────────────────────────────────────────────────────
+const onlineMap = new Map();
+io.on('connection', socket => {
+  socket.on('auth', uid => { if (uid) onlineMap.set(String(uid), socket.id); });
   socket.on('disconnect', () => {
-    for (const [uid, sid] of onlineMap.entries()) {
+    for (const [uid, sid] of onlineMap) {
       if (sid === socket.id) { onlineMap.delete(uid); break; }
     }
   });
 });
-
 function emitTo(userId, event, data) {
-  const sid = onlineMap.get(Number(userId));
+  const sid = onlineMap.get(String(userId));
   if (sid) io.to(sid).emit(event, data);
-}
-
-function getOwner(db) {
-  return db.users.find(u => u.isOwner);
 }
 
 // ──────────────────────────────────────────────────────────
 // HELPERS
 // ──────────────────────────────────────────────────────────
-function buildOrder(db, orderId) {
-  const order = db.orders.find(o => o.id === orderId);
+async function buildOrder(order) {
   if (!order) return null;
-  const creator = db.users.find(u => u.id === order.createdBy);
-  const parts = db.participants.filter(p => p.orderId === orderId).map(p => {
-    const u = db.users.find(u => u.id === p.userId);
-    return { userId: p.userId, name: u ? u.name : '?', status: p.status };
-  });
-  const acceptedCount = parts.filter(p => p.status === 'accepted').length;
-  const share = acceptedCount > 0 ? order.price / acceptedCount : order.price;
+  const creator = await User.findById(order.createdBy);
+  const parts   = await Participant.find({ orderId: order._id });
+  const users   = await User.find({ _id: { $in: parts.map(p => p.userId) } });
+  const userMap = Object.fromEntries(users.map(u => [String(u._id), u.name]));
+  const withNames = parts.map(p => ({
+    userId: String(p.userId),
+    name:   userMap[String(p.userId)] || '?',
+    status: p.status
+  }));
+  const accepted = withNames.filter(p => p.status === 'accepted');
+  const share    = accepted.length > 0 ? order.price / accepted.length : order.price;
   return {
-    ...order,
-    creatorName: creator ? creator.name : '?',
-    participants: parts,
-    acceptedCount,
+    id:            String(order._id),
+    dishName:      order.dishName,
+    price:         order.price,
+    orderType:     order.orderType,
+    createdBy:     String(order.createdBy),
+    createdAt:     order.createdAt,
+    creatorName:   creator ? creator.name : '?',
+    participants:  withNames,
+    acceptedCount: accepted.length,
     share
   };
+}
+
+function genToken() {
+  return crypto.randomBytes(24).toString('hex');
 }
 
 // ──────────────────────────────────────────────────────────
@@ -93,247 +128,265 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── LOGIN ──────────────────────────────────────────────────
-app.post('/api/login', (req, res) => {
-  const { name } = req.body;
-  if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
-  const db = loadDB();
-  const clean = name.trim();
-  let user = db.users.find(u => u.name.toLowerCase() === clean.toLowerCase());
-  if (!user) {
-    user = {
-      id: nextId(db, 'users'),
-      name: clean,
-      isOwner: clean.toLowerCase() === 'krishna',
-      createdAt: new Date().toISOString()
-    };
-    db.users.push(user);
-    saveDB(db);
-  }
-  res.json({ user });
+app.post('/api/login', async (req, res) => {
+  try {
+    const { name, password, sessionToken } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+
+    const cleanName    = name.trim();
+    const isKrishna    = cleanName.toLowerCase() === SUPER_OWNER;
+    const ownerAccess  = password === OWNER_PASSWORD || isKrishna;
+
+    let user = await User.findOne({ name: new RegExp(`^${cleanName}$`, 'i') });
+
+    if (user) {
+      // Name exists — verify session token to prevent name theft
+      if (user.sessionToken && user.sessionToken !== sessionToken) {
+        return res.status(403).json({
+          error: `"${cleanName}" is already taken by someone else. Pick a different name!`
+        });
+      }
+      // Update owner status if they now have the password
+      if (ownerAccess && !user.isOwner) {
+        user.isOwner = true;
+        await user.save();
+      }
+    } else {
+      // New user — create with fresh token
+      const token = genToken();
+      user = await User.create({
+        name:         cleanName,
+        isOwner:      ownerAccess,
+        isSuperOwner: isKrishna,
+        sessionToken: token
+      });
+    }
+
+    res.json({
+      user: {
+        id:           String(user._id),
+        name:         user.name,
+        isOwner:      user.isOwner,
+        isSuperOwner: user.isSuperOwner
+      },
+      sessionToken: user.sessionToken
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── USERS ──────────────────────────────────────────────────
-app.get('/api/users', (req, res) => {
-  const db = loadDB();
-  res.json(db.users.map(u => ({ id: u.id, name: u.name, isOwner: u.isOwner })));
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await User.find().sort({ createdAt: 1 });
+    res.json(users.map(u => ({
+      id: String(u._id), name: u.name,
+      isOwner: u.isOwner, isSuperOwner: u.isSuperOwner
+    })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/users/:id', (req, res) => {
-  const db = loadDB();
-  const uid = Number(req.params.id);
-  const user = db.users.find(u => u.id === uid);
-  if (user?.isOwner) return res.status(403).json({ error: 'Cannot delete owner' });
-  db.users = db.users.filter(u => u.id !== uid);
-  db.notifications = db.notifications.filter(n => n.userId !== uid);
-  db.participants = db.participants.filter(p => p.userId !== uid);
-  saveDB(db);
-  io.emit('user_deleted', { userId: uid });
-  res.json({ success: true });
+app.delete('/api/users/:id', async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.isSuperOwner) return res.status(403).json({ error: 'Cannot delete the super owner' });
+    await Notification.deleteMany({ userId: user._id });
+    await Participant.deleteMany({ userId: user._id });
+    await User.deleteOne({ _id: user._id });
+    io.emit('user_deleted', { userId: String(user._id) });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── ORDERS ────────────────────────────────────────────────
-app.post('/api/orders', (req, res) => {
-  const { dishName, price, orderType, createdBy, participantIds } = req.body;
-  if (!dishName?.trim() || !price || !orderType || !createdBy) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
-  const db = loadDB();
-  const orderId = nextId(db, 'orders');
-  const order = {
-    id: orderId,
-    dishName: dishName.trim(),
-    price: parseFloat(price),
-    orderType,
-    createdBy,
-    createdAt: new Date().toISOString()
-  };
-  db.orders.push(order);
+app.post('/api/orders', async (req, res) => {
+  try {
+    const { dishName, price, orderType, createdBy, participantIds } = req.body;
+    if (!dishName?.trim() || !price || !orderType || !createdBy)
+      return res.status(400).json({ error: 'Missing fields' });
 
-  // Creator is always accepted
-  db.participants.push({ orderId, userId: createdBy, status: 'accepted' });
+    const order = await Order.create({
+      dishName: dishName.trim(), price: parseFloat(price), orderType, createdBy
+    });
+    await Participant.create({ orderId: order._id, userId: createdBy, status: 'accepted' });
 
-  // Group: add others as pending
-  if (orderType === 'group' && Array.isArray(participantIds)) {
-    for (const uid of participantIds) {
-      if (uid !== createdBy) {
-        db.participants.push({ orderId, userId: uid, status: 'pending' });
-        const notifId = nextId(db, 'notifications');
-        db.notifications.push({ id: notifId, userId: uid, orderId, type: 'group_invitation', isRead: false, createdAt: new Date().toISOString() });
+    if (orderType === 'group' && Array.isArray(participantIds)) {
+      for (const uid of participantIds) {
+        if (String(uid) !== String(createdBy)) {
+          await Participant.create({ orderId: order._id, userId: uid, status: 'pending' });
+          await Notification.create({ userId: uid, orderId: order._id, type: 'group_invitation' });
+        }
       }
     }
-  }
 
-  // Notify owner about new order
-  const owner = getOwner(db);
-  if (owner && owner.id !== createdBy) {
-    const notifId = nextId(db, 'notifications');
-    db.notifications.push({ id: notifId, userId: owner.id, orderId, type: 'new_order', isRead: false, createdAt: new Date().toISOString() });
-  }
-
-  saveDB(db);
-
-  const full = buildOrder(db, orderId);
-
-  // Real-time: notify invited participants
-  if (orderType === 'group' && Array.isArray(participantIds)) {
-    for (const uid of participantIds) {
-      if (uid !== createdBy) emitTo(uid, 'group_invitation', full);
+    // Notify all owners
+    const owners = await User.find({ isOwner: true });
+    for (const owner of owners) {
+      if (String(owner._id) !== String(createdBy)) {
+        await Notification.create({ userId: owner._id, orderId: order._id, type: 'new_order' });
+      }
     }
-  }
-  // Notify owner
-  if (owner) emitTo(owner.id, 'new_order', full);
 
-  res.json({ order: full });
+    const full = await buildOrder(order);
+
+    if (orderType === 'group' && Array.isArray(participantIds)) {
+      for (const uid of participantIds) {
+        if (String(uid) !== String(createdBy)) emitTo(uid, 'group_invitation', full);
+      }
+    }
+    for (const owner of owners) {
+      if (String(owner._id) !== String(createdBy)) emitTo(owner._id, 'new_order', full);
+    }
+
+    res.json({ order: full });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/orders/mine', (req, res) => {
-  const uid = Number(req.query.userId);
-  const db = loadDB();
-  const myOrderIds = db.participants.filter(p => p.userId === uid).map(p => p.orderId);
-  const unique = [...new Set(myOrderIds)];
-  const orders = unique.map(id => buildOrder(db, id)).filter(Boolean)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json(orders);
+app.get('/api/orders/mine', async (req, res) => {
+  try {
+    const parts  = await Participant.find({ userId: req.query.userId });
+    const ids    = [...new Set(parts.map(p => String(p.orderId)))];
+    const orders = await Order.find({ _id: { $in: ids } }).sort({ createdAt: -1 });
+    const built  = await Promise.all(orders.map(buildOrder));
+    res.json(built.filter(Boolean));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/orders/all', (req, res) => {
-  const db = loadDB();
-  const orders = db.orders.map(o => buildOrder(db, o.id)).filter(Boolean)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json(orders);
+app.get('/api/orders/all', async (req, res) => {
+  try {
+    const orders = await Order.find().sort({ createdAt: -1 });
+    const built  = await Promise.all(orders.map(buildOrder));
+    res.json(built.filter(Boolean));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/orders/:id/respond', (req, res) => {
-  const orderId = Number(req.params.id);
-  const { userId, response } = req.body;
-  const db = loadDB();
+app.post('/api/orders/:id/respond', async (req, res) => {
+  try {
+    const { userId, response } = req.body;
+    await Participant.updateOne({ orderId: req.params.id, userId }, { status: response });
+    await Notification.updateMany({ orderId: req.params.id, userId }, { isRead: true });
 
-  const part = db.participants.find(p => p.orderId === orderId && p.userId === userId);
-  if (part) part.status = response;
+    const order = await Order.findById(req.params.id);
+    const full  = await buildOrder(order);
+    const user  = await User.findById(userId);
 
-  // Mark the notification read
-  db.notifications.forEach(n => {
-    if (n.orderId === orderId && n.userId === userId) n.isRead = true;
-  });
-
-  saveDB(db);
-
-  const full = buildOrder(db, orderId);
-  const user = db.users.find(u => u.id === userId);
-
-  // Notify order creator
-  if (full) {
-    emitTo(full.createdBy, 'invitation_response', { orderId, userName: user?.name, response, order: full });
-    const owner = getOwner(db);
-    if (owner && owner.id !== full.createdBy) emitTo(owner.id, 'order_updated', full);
-    else if (owner) emitTo(owner.id, 'order_updated', full);
-  }
-
-  res.json({ success: true, order: full });
+    if (full) {
+      emitTo(full.createdBy, 'invitation_response', {
+        orderId: full.id, userName: user?.name, response, order: full
+      });
+      const owners = await User.find({ isOwner: true });
+      for (const o of owners) emitTo(o._id, 'order_updated', full);
+    }
+    res.json({ success: true, order: full });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/orders/:id', (req, res) => {
-  const orderId = Number(req.params.id);
-  const db = loadDB();
-  db.orders = db.orders.filter(o => o.id !== orderId);
-  db.participants = db.participants.filter(p => p.orderId !== orderId);
-  db.notifications = db.notifications.filter(n => n.orderId !== orderId);
-  saveDB(db);
-  io.emit('order_deleted', { orderId });
-  res.json({ success: true });
+app.delete('/api/orders/:id', async (req, res) => {
+  try {
+    await Order.deleteOne({ _id: req.params.id });
+    await Participant.deleteMany({ orderId: req.params.id });
+    await Notification.deleteMany({ orderId: req.params.id });
+    io.emit('order_deleted', { orderId: req.params.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── NOTIFICATIONS ─────────────────────────────────────────
-app.get('/api/notifications', (req, res) => {
-  const uid = Number(req.query.userId);
-  const db = loadDB();
-  const notifs = db.notifications
-    .filter(n => n.userId === uid && !n.isRead)
-    .map(n => {
-      const order = buildOrder(db, n.orderId);
-      return { ...n, order };
-    })
-    .filter(n => n.order)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json(notifs);
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const notifs = await Notification.find({ userId: req.query.userId, isRead: false }).sort({ createdAt: -1 });
+    const result = await Promise.all(notifs.map(async n => {
+      const order = await Order.findById(n.orderId);
+      const full  = await buildOrder(order);
+      return { id: String(n._id), type: n.type, createdAt: n.createdAt, order: full };
+    }));
+    res.json(result.filter(n => n.order));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/notifications/count', (req, res) => {
-  const uid = Number(req.query.userId);
-  const db = loadDB();
-  const count = db.notifications.filter(n => n.userId === uid && !n.isRead).length;
-  res.json({ count });
+app.get('/api/notifications/count', async (req, res) => {
+  try {
+    const count = await Notification.countDocuments({ userId: req.query.userId, isRead: false });
+    res.json({ count });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/notifications/read-all', (req, res) => {
-  const uid = Number(req.body.userId);
-  const db = loadDB();
-  db.notifications.filter(n => n.userId === uid).forEach(n => n.isRead = true);
-  saveDB(db);
-  res.json({ success: true });
+app.post('/api/notifications/read-all', async (req, res) => {
+  try {
+    await Notification.updateMany({ userId: req.body.userId }, { isRead: true });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── BILL ──────────────────────────────────────────────────
-app.get('/api/bill', (req, res) => {
-  const db = loadDB();
-  const s = db.billSettings;
+app.get('/api/bill', async (req, res) => {
+  try {
+    let s = await BillSettings.findById('singleton');
+    if (!s) s = { cgst: 0, sgst: 0, serviceCharge: 0, discount: 0 };
 
-  const userBreakdowns = db.users.map(user => {
-    const myParts = db.participants.filter(p => p.userId === user.id && p.status === 'accepted');
-    const orderLines = myParts.map(p => {
-      const order = buildOrder(db, p.orderId);
-      return order ? {
-        orderId: order.id,
-        dishName: order.dishName,
-        totalPrice: order.price,
-        orderType: order.orderType,
-        participants: order.acceptedCount,
-        share: order.share
-      } : null;
-    }).filter(Boolean);
-    const base = orderLines.reduce((s, o) => s + o.share, 0);
-    return { id: user.id, name: user.name, base, orders: orderLines };
-  }).filter(u => u.orders.length > 0);
+    const users = await User.find();
+    const userBreakdowns = await Promise.all(users.map(async user => {
+      const myParts = await Participant.find({ userId: user._id, status: 'accepted' });
+      const lines   = (await Promise.all(myParts.map(async p => {
+        const order = await Order.findById(p.orderId);
+        if (!order) return null;
+        const accepted = await Participant.countDocuments({ orderId: order._id, status: 'accepted' });
+        return {
+          orderId: String(order._id), dishName: order.dishName,
+          totalPrice: order.price, orderType: order.orderType,
+          participants: accepted,
+          share: accepted > 0 ? order.price / accepted : order.price
+        };
+      }))).filter(Boolean);
+      return { id: String(user._id), name: user.name, base: lines.reduce((s,o) => s+o.share, 0), orders: lines };
+    }));
 
-  const grandBase = userBreakdowns.reduce((s, u) => s + u.base, 0);
+    const active      = userBreakdowns.filter(u => u.orders.length > 0);
+    const grandBase   = active.reduce((s, u) => s + u.base, 0);
+    const cgstAmt     = grandBase * s.cgst / 100;
+    const sgstAmt     = grandBase * s.sgst / 100;
+    const serviceAmt  = grandBase * s.serviceCharge / 100;
+    const preTax      = grandBase + cgstAmt + sgstAmt + serviceAmt;
+    const discountAmt = preTax * s.discount / 100;
+    const finalTotal  = preTax - discountAmt;
 
-  const cgstAmt     = grandBase * s.cgst / 100;
-  const sgstAmt     = grandBase * s.sgst / 100;
-  const serviceAmt  = grandBase * s.serviceCharge / 100;
-  const preTax      = grandBase + cgstAmt + sgstAmt + serviceAmt;
-  const discountAmt = preTax * s.discount / 100;
-  const finalTotal  = preTax - discountAmt;
-
-  const users = userBreakdowns.map(u => ({
-    ...u,
-    finalShare: grandBase > 0 ? (u.base / grandBase) * finalTotal : 0
-  }));
-
-  res.json({ settings: s, grandBase, cgstAmt, sgstAmt, serviceAmt, preTax, discountAmt, finalTotal, users });
+    res.json({
+      settings: { cgst: s.cgst, sgst: s.sgst, serviceCharge: s.serviceCharge, discount: s.discount },
+      grandBase, cgstAmt, sgstAmt, serviceAmt, preTax, discountAmt, finalTotal,
+      users: active.map(u => ({
+        ...u, finalShare: grandBase > 0 ? (u.base / grandBase) * finalTotal : 0
+      }))
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/bill/settings', (req, res) => {
-  const db = loadDB();
-  db.billSettings = {
-    cgst:          parseFloat(req.body.cgst)          || 0,
-    sgst:          parseFloat(req.body.sgst)          || 0,
-    serviceCharge: parseFloat(req.body.serviceCharge) || 0,
-    discount:      parseFloat(req.body.discount)      || 0
-  };
-  saveDB(db);
-  res.json({ success: true });
+app.put('/api/bill/settings', async (req, res) => {
+  try {
+    const { cgst, sgst, serviceCharge, discount } = req.body;
+    await BillSettings.findByIdAndUpdate('singleton',
+      { cgst: +cgst||0, sgst: +sgst||0, serviceCharge: +serviceCharge||0, discount: +discount||0 },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── RESET ─────────────────────────────────────────────────
-app.post('/api/reset', (req, res) => {
-  fs.writeFileSync(DB_PATH, JSON.stringify(freshDB(), null, 2));
-  io.emit('reset');
-  res.json({ success: true });
+// ── RESET (super owner only) ───────────────────────────────
+app.post('/api/reset', async (req, res) => {
+  try {
+    await Promise.all([
+      User.deleteMany({}), Order.deleteMany({}),
+      Participant.deleteMany({}), Notification.deleteMany({}),
+      BillSettings.deleteMany({})
+    ]);
+    io.emit('reset');
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`\n🍽️  DinnerTab is live → http://localhost:${PORT}`);
-  console.log('   Owner login name: krishna\n');
+  console.log(`   Super owner: ${SUPER_OWNER} | Owner password: ${OWNER_PASSWORD}\n`);
 });

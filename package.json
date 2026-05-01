@@ -1,8 +1,14 @@
 {
   "name": "dinner-splitter",
   "version": "1.0.0",
+  "description": "Smart dinner bill splitter for groups",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "express": "^4.18.2",
+    "mongoose": "^8.3.0",
     "socket.io": "^4.7.4"
   }
 }
