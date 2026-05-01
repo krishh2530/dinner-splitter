@@ -1,0 +1,25 @@
+{
+  "users": [
+    {
+      "id": 1,
+      "name": "Krishna",
+      "isOwner": true,
+      "createdAt": "2026-05-01T07:57:53.871Z"
+    }
+  ],
+  "orders": [],
+  "participants": [],
+  "notifications": [],
+  "billSettings": {
+    "cgst": 0,
+    "sgst": 0,
+    "serviceCharge": 0,
+    "discount": 0
+  },
+  "_seq": {
+    "users": 1,
+    "orders": 0,
+    "participants": 0,
+    "notifications": 0
+  }
+}
