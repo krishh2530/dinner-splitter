@@ -13,9 +13,23 @@ const io     = new Server(server);
 // MONGODB CONNECTION
 // ──────────────────────────────────────────────────────────
 const MONGO_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/dinnertab';
-mongoose.connect(MONGO_URI)
-  .then(() => console.log('✅ MongoDB connected'))
-  .catch(err => { console.error('❌ MongoDB error:', err.message); process.exit(1); });
+// Connect first, then start server
+async function startServer() {
+  try {
+    await mongoose.connect(MONGO_URI);
+    console.log('✅ MongoDB connected');
+    server.listen(PORT, () => {
+      console.log(`
+🍽️  DinnerTab is live → http://localhost:${PORT}`);
+      console.log(`   Super owner: ${SUPER_OWNER} | Owner password: ${OWNER_PASSWORD}
+`);
+    });
+  } catch (err) {
+    console.error('❌ MongoDB connection failed:', err.message);
+    console.error('Check your MONGODB_URI environment variable on Render.');
+    process.exit(1);
+  }
+}
 
 // ──────────────────────────────────────────────────────────
 // CONSTANTS
@@ -386,7 +400,4 @@ app.post('/api/reset', async (req, res) => {
 
 // ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`\n🍽️  DinnerTab is live → http://localhost:${PORT}`);
-  console.log(`   Super owner: ${SUPER_OWNER} | Owner password: ${OWNER_PASSWORD}\n`);
-});
+startServer();
