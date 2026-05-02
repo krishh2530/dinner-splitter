@@ -18,32 +18,27 @@ const OWNER_PASSWORD = 'FinalHangout';
 const SUPER_OWNER    = 'krishna';
 
 // ──────────────────────────────────────────────────────────
-// MONGODB — retry forever, never crash Render
+// MONGODB — let mongoose handle reconnects automatically
 // ──────────────────────────────────────────────────────────
 let dbReady = false;
 
-function connectDB() {
-  mongoose.connect(MONGO_URI, {
-    serverSelectionTimeoutMS: 10000,
-    connectTimeoutMS: 10000,
-  })
-  .then(() => {
-    dbReady = true;
-    console.log('✅ MongoDB connected');
-  })
-  .catch(err => {
-    dbReady = false;
-    console.error('❌ MongoDB failed:', err.message);
-    console.log('⏳ Retrying in 5 seconds...');
-    setTimeout(connectDB, 5000);
-  });
-}
-
-mongoose.connection.on('disconnected', () => {
-  dbReady = false;
-  console.log('⚠️  MongoDB disconnected — reconnecting...');
-  setTimeout(connectDB, 3000);
+mongoose.connect(MONGO_URI, {
+  serverSelectionTimeoutMS: 30000,
+  socketTimeoutMS: 45000,
+  maxPoolSize: 10,
+})
+.then(() => {
+  dbReady = true;
+  console.log('✅ MongoDB connected');
+})
+.catch(err => {
+  console.error('❌ MongoDB failed:', err.message);
+  process.exit(1);
 });
+
+mongoose.connection.on('connected',    () => { dbReady = true;  console.log('✅ MongoDB connected'); });
+mongoose.connection.on('disconnected', () => { dbReady = false; console.log('⚠️  MongoDB disconnected'); });
+mongoose.connection.on('reconnected',  () => { dbReady = true;  console.log('✅ MongoDB reconnected'); });
 
 // Middleware: block API calls if DB not ready
 function requireDB(req, res, next) {
@@ -426,7 +421,5 @@ app.post('/api/reset', requireDB, async (req, res) => {
 // START — HTTP server starts immediately, DB connects in bg
 // ──────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`\n🍽️  DinnerTab is live → http://localhost:${PORT}`);
-  console.log(`   Connecting to MongoDB...\n`);
-  connectDB();
+  console.log(`\n🍽️  DinnerTab is live → http://localhost:${PORT}\n`);
 });
