@@ -13,7 +13,7 @@ const io     = new Server(server);
 // CONFIG
 // ──────────────────────────────────────────────────────────
 const PORT           = process.env.PORT || 3000;
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/dinnertab';
+const MONGO_URI      = process.env.MONGODB_URI || 'mongodb://localhost:27017/dinnertab';
 const OWNER_PASSWORD = 'FinalHangout';
 const SUPER_OWNER    = 'krishna';
 
@@ -172,20 +172,22 @@ app.post('/api/login', requireDB, async (req, res) => {
     const isKrishna   = cleanName.toLowerCase() === SUPER_OWNER;
     const ownerAccess = password === OWNER_PASSWORD || isKrishna;
 
-    let user = await User.findOne({ name: new RegExp(`^${cleanName}$`, 'i') });
+    let user = await User.findOne({ name: new RegExp('^' + cleanName + '$', 'i') });
 
     if (user) {
-      // Name exists — verify session token
-      if (user.sessionToken && user.sessionToken !== sessionToken) {
-        return res.status(403).json({
-          error: `"${cleanName}" is already taken. Pick a different name!`
-        });
-      }
-      // Upgrade to owner if correct password given
-      if (ownerAccess && !user.isOwner) {
+      if (ownerAccess) {
+        // Owner password = always allow from any device, refresh token
         user.isOwner      = true;
         user.isSuperOwner = isKrishna;
+        user.sessionToken = genToken();
         await user.save();
+      } else {
+        // Normal user: block if token mismatch (name taken by someone else)
+        if (user.sessionToken && user.sessionToken !== sessionToken) {
+          return res.status(403).json({
+            error: '"' + cleanName + '" is already taken by someone else. Pick a different name!'
+          });
+        }
       }
     } else {
       // New user
